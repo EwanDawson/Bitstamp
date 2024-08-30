@@ -8,14 +8,22 @@ BeginPackage["EwanDawson`Bitstamp`"];
 
 
 BitstampAddCredentials::usage = "
-	BitstampAddCredentials[SystemCredentials[\"Bitstamp Main Account API Key\"]];
 	BitstampAddCredentials[SystemCredentials[\"Bitstamp XYZ Sub-account API Key\"], \"XYZ\"];
 ";
 
 
+Bitstamp::usage = "
+	Invoke Bitstamp public API endpoints.
+	
+	Examples:
+	Bitstamp[\"Ticker\"] gets the ticker prices
+";
+
+
 BitstampAccount::usage = "
-	account = BitstampAccount[]
-	account = BitstampAccount[\"Sub account name\"]
+	Invoke Bitstamp private API funtions, using the keys associated with an account that's already been registered using BitstampAddCredentials[].
+
+	account = BitstampAccount[\"Account name\"]
 	
 	account[\"OpenOrders\"]
 	account[\"AccountBalances\"]
@@ -24,6 +32,16 @@ BitstampAccount::usage = "
 	account[\"CancelOrder\", order]
 	account[\"OrderStatus\", order]
 	account[\"PlanceOrder\", BitstampOrder]
+";
+
+
+BitstampAccounts::usage = "
+	BitstampAccount[] gives the list of accounts for which creditials have been added.
+";
+
+
+BitstampLastPrice::usage = "
+	BitstampLastPrice[BitstampMarket[\"BTC\",\"GBP\"]] gives the latest BTC/GBP price. The result is cached for 5 seconds.
 ";
 
 
@@ -46,79 +64,18 @@ Begin["`Private`"];
 (*API credentials*)
 
 
-(* ::Text:: *)
-(*Load the Bitstamp API key from the system credentials store. If we're running in the cloud, load from an encrypted cloud object, asking the user for the decryption key.*)
-
-
-(* ::Input::Initialization:: *)
-(*copperleafblows*)
-Once[BitstampSwitchAccount["Main"]];
-
-
-BitstampAuthenticate[creds_SystemCredentialData] :=
-    (
-        $BitstampApiKey = creds;
-        Enclose[
-            Confirm[
-                BitstampAPIExecute["AccountBalances"];
-                Success["Authenticated", <||>]
-            ]
-        ]
-    );
-
-
-BitstampAccount[] :=
-    $BitstampAccount;
-
-
-BitstampSwitchAccount["Main"] :=
-    Module[{
-        result =
-            BitstampAuthenticate[
-                Module[{
-                    cred =
-                        If[$CloudEvaluation,
-                            Decrypt[AuthenticationDialog["Password", 
-                                "WindowTitle" -> "Decryption key for Bitstamp API credentials"]["Password"
-                                ], PersistentSymbol["BITSTAMP_API_KEY", "Cloud"]]
-                            ,
-                            SystemCredential["BITSTAMP_API_KEY"]
-                        ]
-                },
-                    If[!MatchQ[cred, _SystemCredentialData],
-                        Missing["No Bitstamp API key found"]
-                        ,
-                        cred
-                    ]
-                ]
-            ]
-    },
-        Enclose[
-            Confirm[$result];
-            $BitstampAccount = "Main";
-            result
-        ]
-    ];
-
-BitstampSwitchAccount[account_String] :=
-    Module[{result = BitstampAuthenticate[SystemCredential["Bitstamp/"
-         <> account <> "/API"]]},
-        Enclose[
-            Confirm[$result];
-            $BitstampAccount = account;
-            result
-        ]
-    ];
-
-
-Once[$CredentialsStore = <||>];
+Once[$BitstampCredentialStore = <||>];
 
 BitstampAddCredentials[creds : KeyValuePattern[{"Key" -> _String, "Secret"
-     -> _String}], account_:None] :=
-    $CredentialsStore[account] = Association @ creds;
+     -> _String}], account_String] :=
+    (
+        $BitstampCredentialStore[account] = Association @ creds;
+        Success["CredentialAdded", <|"MessageTemplate" -> "Key for account `account` added.",
+             "MessageParameters" -> <|"account" -> account|>|>]
+    );
 
-BitstampAddCredentials[creds_SystemCredentialData, account_:None] :=
-    AddCredentials[
+BitstampAddCredentials[creds_SystemCredentialData, account_String] :=
+    BitstampAddCredentials[
         creds //
         Normal //
         First
@@ -126,35 +83,34 @@ BitstampAddCredentials[creds_SystemCredentialData, account_:None] :=
         account
     ];
 
+BitstampAccounts[] :=
+    Keys[$BitstampCredentialStore];
+
 
 (* ::Subsection:: *)
 (*Utility functions for making API calls*)
 
 
-(* ::Code::Initialization:: *)
 GenerateNonce[] :=
     StringJoin @ RandomChoice[CharacterRange @@ Flatten @ ToCharacterCode[
         {"a", "z"}], 36];
 
 
-(* ::Code::Initialization:: *)
 Timestamp[] :=
     IntegerString[UnixTime[] * 1000];
 
 
-(* ::Code::Initialization:: *)
 BitstampAPIBaseRequest[path_List] :=
     <|"Scheme" -> "https", "Domain" -> "www.bitstamp.net", "Path" -> 
         ToString /@ Join[{"", "api", "v2"}, path /. BitstampMarket[left_, right_
         ] :> ToLowerCase[left <> right], {""}]|>;
 
 
-(* ::Code::Initialization:: *)
-SignBitstampAPIRequest[request_HTTPRequest] :=
-    Module[{key = $BitstampApiKey["Data"]["Key"], secret = $BitstampApiKey[
-        "Secret"], nonce = GenerateNonce[], timestamp = Timestamp[], hmac = ResourceFunction[
-        "HMAC"], signature, authHeaders, hasBody = !StringMatchQ[request["Body"
-        ], ""]},
+SignBitstampAPIRequest[request_HTTPRequest, accountName_String] :=
+    Module[{key = $BitstampCredentialStore[accountName]["Key"], secret = $BitstampCredentialStore[
+        accountName]["Secret"], nonce = GenerateNonce[], timestamp = Timestamp[
+        ], hmac = ResourceFunction["HMAC"], signature, authHeaders, hasBody =
+         !StringMatchQ[request["Body"], ""]},
         signature = BaseEncode[hmac[StringJoin[Join[{"BITSTAMP", " ",
              key}, Values @ request[{Method, "Domain", "PathString", "QueryString",
              "ContentType"}], {nonce, timestamp, "v2"}, Values @ request[{"Body"}
@@ -167,36 +123,44 @@ SignBitstampAPIRequest[request_HTTPRequest] :=
     ];
 
 
-(* ::Code::Initialization:: *)
 Needs["Toolbelt`"];
 
-BitstampAPIRequest[path_List] :=
-    SignBitstampAPIRequest @ HTTPRequest @ Association[BitstampAPIBaseRequest
-         @ path, Method -> "GET"];
+BitstampAPIRequest[path_List, accountName_String] :=
+    SignBitstampAPIRequest[HTTPRequest @ Association[BitstampAPIBaseRequest
+         @ path, Method -> "GET"], accountName];
 
-BitstampAPIRequest[path_List, body_Association] :=
-    SignBitstampAPIRequest @
-        HTTPRequest @
-            Association[
-                BitstampAPIBaseRequest @ path
-                ,
-                Method -> "POST"
-                ,
-                Sequence[
-                    If[Length @ body > 0,
-                        {"Body" -> WWWFormURLEncode @ body, "ContentType"
-                             -> "application/x-www-form-urlencoded"}
-                        ,
-                        {"ContentType" -> ""}
+BitstampAPIRequest[path_List, body_Association, accountName_String] :=
+    With[{
+        request =
+            HTTPRequest @
+                Association[
+                    BitstampAPIBaseRequest @ path
+                    ,
+                    Method -> "POST"
+                    ,
+                    Sequence[
+                        If[Length @ body > 0,
+                            {"Body" -> WWWFormURLEncode @ body, "ContentType"
+                                 -> "application/x-www-form-urlencoded"}
+                            ,
+                            {"ContentType" -> ""}
+                        ]
                     ]
                 ]
-            ];
+    },
+        Switch[accountName,
+            "",
+                request
+            ,
+            _,
+                SignBitstampAPIRequest[request, accountName]
+        ]
+    ];
 
-BitstampAPIRequest[path_List, body_List] :=
-    BitstampAPIRequest[path, Association @ body]
+BitstampAPIRequest[path_List, body_List, accountName_String] :=
+    BitstampAPIRequest[path, Association @ body, accountName];
 
 
-(* ::Code::Initialization:: *)
 NormalizeParamName[name_String] :=
     ToLowerCase[StringReplace[name, a_?LowerCaseQ ~~ b_?UpperCaseQ :>
          a <> "_" <> b]];
@@ -243,82 +207,105 @@ NormalizeParams[params_List] :=
 (*Bitstamp API calls*)
 
 
-(* ::Code::Initialization:: *)
 $ResponseTransformations = Dispatch[{("market" -> market_) :> ("market"
      -> BitstampMarket @@ StringSplit[market, "/"]), ("datetime" -> datetime_
     ) :> ("datetime" -> FromDateString[datetime, TimeZone -> "UTC"]), ("type"
      -> "0") -> ("type" -> "Buy"), ("type" -> "1") -> ("type" -> "Sell"),
      ("amount" -> amount_) :> ("amount" -> Interpreter["Number"][amount]),
-     ("price" -> price_) :> ("price" -> Interpreter["Number"][price])}]
+     ("price" -> price_) :> ("price" -> Interpreter["Number"][price])}];
 
-BitstampAPIExecute[request_HTTPRequest, f_:Identity] :=
-    With[{response = URLRead[request]},
+BitstampAPIExecute[path_List, params_, accountName_String, f_:Identity
+    ] :=
+    With[{response = URLRead[BitstampAPIRequest[path, NormalizeParams
+         @ params, accountName]]},
         If[FailureQ @ response,
             Return @ Failure["Bitstamp API Error", <|"MessageTemplate"
                  -> response["Message"]|>]
         ];
         Enclose[f @ ReplaceAll[(key_ -> value_) :> (StringJoin[Capitalize
              /@ StringSplit[key, "_"]] -> value)] @ ReplaceAll[$ResponseTransformations
-            ] @ Echo@Import @ ConfirmBy[response, #["StatusCode"] == 200&], Failure["Bitstamp API Error",
+            ] @ Import @ ConfirmBy[response, #["StatusCode"] == 200&], Failure["Bitstamp API Error",
              <|"MessageTemplate" -> "`StatusCode`: `StatusCodeDescription`\n`Body`",
              "MessageParameters" -> response[{"StatusCode", "StatusCodeDescription",
              "Body"}]|>]&]
     ];
 
-BitstampAPIExecute["Ticker"] :=
-    BitstampAPIExecute[BitstampAPIRequest[{"ticker"}]];
+BitstampPublicAPIExecute[path_List, params_, f_:Identity] :=
+    BitstampAPIExecute[path, params, "", f];
 
-BitstampAPIExecute["PlaceOrder", BitstampOrder[params : KeyValuePattern[
-    {"Status" -> "Draft", "Type" -> type : "Buy" | "Sell", "Market" -> market_BitstampMarket,
-     "Amount" -> _Quantity, "Price" -> _Quantity}]]] :=
-    With[{apiCall = (type /. {"Buy" -> "BuyLimitOrder", "Sell" -> "SellLimitOrder"
-        })},
-        BitstampOrder[Merge[{params, Prepend["Status"->"Placed"]@Apply[Identity] @ BitstampAPIExecute[
-            apiCall, market, KeyTake[params, {"Amount", "Price", "LimitPrice", "DailyOrder",
-             "IocOrder", "FocOrder", "MocOrder", "GtdOrder", "ExpireTime", "ClientOrderId"
-            }]]}, Last]]
+Bitstamp["Ticker"] :=
+    BitstampPublicAPIExecute[{"ticker"}, {}];
+
+BitstampAccount[accountName_String]["PlaceOrder", BitstampOrder[params
+     : KeyValuePattern[{"Status" -> "Draft", "Type" -> type : "Buy" | "Sell",
+     "Market" -> market_BitstampMarket, "Amount" -> _Quantity, "Price" ->
+     _Quantity}]]] :=
+    With[{apiCall = (type /. {"Buy" -> "buy", "Sell" -> "sell"})},
+        BitstampOrder[Merge[{params, Prepend["Status" -> "Placed"] @ 
+            Apply[Identity] @ BitstampAPIExecute[{apiCall, market}, KeyTake[params,
+             {"Amount", "Price", "LimitPrice", "DailyOrder", "IocOrder", "FocOrder",
+             "MocOrder", "GtdOrder", "ExpireTime", "ClientOrderId"}], accountName,
+             BitStampOrder]}, Last]]
     ];
 
-BitstampAPIExecute["PlaceOrder", BitstampOrder[params_]] :=Enclose[ConfirmMatch[params,KeyValuePattern[
-    {"Status" -> "Draft", "Type" -> "Buy" | "Sell", "Market" -> _BitstampMarket,
-     "Amount" -> _Quantity, "Price" -> _Quantity}]]];
+BitstampAccount[accountName_String]["PlaceOrder", BitstampOrder[params_
+    ]] :=
+    Enclose[ConfirmMatch[params, KeyValuePattern[{"Status" -> "Draft",
+         "Type" -> "Buy" | "Sell", "Market" -> _BitstampMarket, "Amount" -> _Quantity,
+         "Price" -> _Quantity}]]];
 
-BitstampAPIExecute["OpenOrders"] :=
-    BitstampAPIExecute[BitstampAPIRequest[{"open_orders"}, {}], Map[BitstampOrder
+BitstampAccount[accountName_String]["OpenOrders"] :=
+    BitstampAPIExecute[{"open_orders"}, {}, accountName, Map[BitstampOrder
         ]];
 
-BitstampAPIExecute["AccountBalances"] :=
-    BitstampAPIExecute @ BitstampAPIRequest[{"account_balances"}, {}];
+BitstampAccount[accountName_String]["AccountBalances"] :=
+    BitstampAPIExecute[{"account_balances"}, {}, accountName];
 
-BitstampAPIExecute["BuyLimitOrder", market_BitstampMarket, parameters_Association
+BitstampAccount[accountName_String]["BuyLimitOrder", market_BitstampMarket,
+     parameters_Association] :=
+    BitstampAPIExecute[{"buy", market}, NormalizeParams @ parameters,
+         accountName, BitstampOrder];
+
+BitstampAccount[accountName_String]["SellLimitOrder", market_BitstampMarket,
+     parameters_Association] :=
+    BitstampAPIExecute[{"sell", market}, NormalizeParams @ parameters,
+         accountName, BitstampOrder];
+
+BitstampAccount[accountName_String]["CancelOrder", order_BitstampOrder
     ] :=
-    BitstampAPIExecute[BitstampAPIRequest[{"buy", market}, NormalizeParams
-         @ parameters], BitstampOrder];
+    BitstampAPIExecute[{"cancel_order"}, {"id" -> order["ID"]}, accountName,
+         BitstampOrder];
 
-BitstampAPIExecute["SellLimitOrder", market_BitstampMarket, parameters_Association
+BitstampAccount[accountName_String]["UserTransactions", market_BitstampMarket,
+     parameters_Association] :=
+    BitstampAPIExecute[{"user_transactions", market}, NormalizeParams
+         @ parameters, accountName];
+
+BitstampAccount[accountName_String]["OrderStatus", order_BitstampOrder
     ] :=
-    BitstampAPIExecute[BitstampAPIRequest[{"sell", market}, NormalizeParams
-         @ parameters], BitstampOrder];
+    BitstampAPIExecute[{"order_status"}, {"id" -> order["Id"], "omit_transactions"
+         -> "false"}, accountName, BitstampOrder];
 
-BitstampAPIExecute["CancelOrder", order_BitstampOrder] :=
-    BitstampAPIExecute[BitstampAPIRequest[{"cancel_order"}, {"id" -> 
-        order["ID"]}], BitstampOrder];
-
-BitstampAPIExecute["UserTransactions", market_BitstampMarket, parameters_Association
-    ] :=
-    BitstampAPIExecute[BitstampAPIRequest[{"user_transactions", market
-        }, NormalizeParams @ parameters]];
-
-BitstampAPIExecute["OrderStatus", order_BitstampOrder] :=
-    BitstampAPIExecute[BitstampAPIRequest[{"order_status"}, {"id" -> 
-        order["Id"], "omit_transactions" -> "false"}], BitstampOrder];
+BitstampLastPrice[market_BitstampMarket] :=
+    CreateCachedValue[
+        "BitstampLastPrice/" <> ToString[market]
+        ,
+        5
+        ,
+        Function[{},
+            Bitstamp["Ticker"] //
+            SelectFirst[Lookup[#, "Pair"] == ToString @ market&] //
+            Lookup["Last"] //
+            FromDigits //
+            Quantity[#, market[[2]]]&
+        ]
+    ][];
 
 
 (* ::Subsection:: *)
 (*Bitstamp objects*)
 
 
-(* ::Code::Initialization:: *)
 BitstampMarket /: ToString[BitstampMarket[asset_String, denomination_String
     ]] :=
     ToUpperCase @ StringRiffle[{asset, denomination}, "/"];
@@ -329,7 +316,11 @@ BitstampMarket /: MakeBoxes[BitstampMarket[asset_, denomination_], StandardForm
          StandardForm]}];
 
 
-(* ::Code::Initialization:: *)
+BitstampAccount /: ToString[BitstampAccount[name_]] := ToString[name];
+
+BitstampAccount /: MakeBoxes[BitstampAccount[name_], StandardForm] := RowBox[{MakeBoxes[name, StandardForm]}];
+
+
 BitstampOrder[data_List] :=
     BitstampOrder[
         data //
@@ -350,7 +341,7 @@ BitstampOrder[data_Association][prop_] :=
     BitstampOrder[data][{prop}];
 
 BitstampOrder[data_Association][props__] :=
-    BitstampOrder[data][{props}]
+    BitstampOrder[data][{props}];
 
 
 (* ::Section:: *)
